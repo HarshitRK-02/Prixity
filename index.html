@@ -5,13 +5,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Pixrity Voice Agent</title>
     <style>
-        body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; background-color: #f0f2f5; margin: 0; }
-        .container { background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); text-align: center; width: 400px; }
-        button { padding: 12px 24px; font-size: 16px; background-color: #007bff; color: white; border: none; border-radius: 8px; cursor: pointer; transition: background 0.2s; margin: 5px; }
-        button:hover { background-color: #0056b3; }
-        button:disabled { background-color: #ccc; cursor: not-allowed; }
-        #status { margin-top: 20px; color: #666; font-weight: bold; min-height: 1.2em; }
+        body { font-family: 'Segoe UI', sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; background-color: #f0f2f5; margin: 0; }
+        .container { background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.1); text-align: center; width: 400px; }
+        button { padding: 12px 24px; font-size: 16px; background-color: #007bff; color: white; border: none; border-radius: 8px; cursor: pointer; transition: all 0.2s; margin: 5px; font-weight: 600; }
+        button:hover { background-color: #0056b3; transform: translateY(-1px); }
+        button:disabled { background-color: #ccc; cursor: not-allowed; transform: none; }
+        #status { margin-top: 20px; color: #666; font-weight: bold; min-height: 1.2em; padding: 10px; border-radius: 4px; }
         .visualizer { height: 50px; background: #e9ecef; margin-top: 20px; border-radius: 4px; display: flex; align-items: center; justify-content: center; font-size: 0.9rem; color: #555; }
+        .debug-info { margin-top: 20px; font-size: 12px; color: #999; text-align: left; background: #f8f9fa; padding: 10px; border-radius: 4px; border: 1px solid #eee; display: none;}
     </style>
 </head>
 <body>
@@ -28,6 +29,8 @@
     <div class="visualizer" id="visualizer">
         (Microphone Inactive)
     </div>
+    
+    <div id="debug" class="debug-info"></div>
 </div>
 
 <script>
@@ -35,29 +38,43 @@
     let audioContext;
     let processor;
     let inputSource;
+    let keepErrorOnScreen = false;
 
     function logStatus(message, isError = false) {
+        // If we have a critical error, don't overwrite it with "Disconnected"
+        if (keepErrorOnScreen && !isError && message === "Disconnected") return;
+
         const statusDiv = document.getElementById('status');
         statusDiv.innerText = message;
-        statusDiv.style.color = isError ? "red" : "#666";
-        console.log(message);
+        statusDiv.style.backgroundColor = isError ? "#ffebee" : "transparent";
+        statusDiv.style.color = isError ? "#c62828" : "#666";
+        console.log(`[Status] ${message}`);
+        
+        if (isError) keepErrorOnScreen = true;
+    }
+
+    function debugLog(msg) {
+        const d = document.getElementById('debug');
+        d.style.display = 'block';
+        d.innerHTML += `<div>${msg}</div>`;
+        console.log(`[Debug] ${msg}`);
     }
 
     async function startCall() {
+        keepErrorOnScreen = false;
+        document.getElementById('debug').innerHTML = "";
         logStatus("Connecting to server...");
         document.getElementById('startBtn').disabled = true;
 
         try {
-            // Connect to the Python Server
             websocket = new WebSocket("ws://localhost:8765/ws");
             websocket.binaryType = "arraybuffer";
 
             websocket.onopen = async () => {
-                logStatus("Server Connected! Requesting Mic...");
+                logStatus("Server Connected! Starting Mic...");
+                debugLog("WebSocket Open");
                 document.getElementById('stopBtn').style.display = "inline-block";
                 document.getElementById('stopBtn').disabled = false;
-                
-                // Start microphone only after server connects
                 await startAudioStream();
             };
 
@@ -65,36 +82,48 @@
                 playAudioQueue(event.data);
             };
 
-            websocket.onclose = () => {
-                stopCall();
+            websocket.onclose = (event) => {
+                debugLog(`WebSocket Closed. Code: ${event.code}, Reason: ${event.reason || 'None'}`);
+                if (event.code === 1006) {
+                    logStatus("Error: Server closed connection unexpectedly. Check Python terminal for crash.", true);
+                } else {
+                    stopCall();
+                }
             };
 
             websocket.onerror = (err) => {
-                logStatus("Connection Error. Is the Python server running?", true);
-                console.error(err);
+                debugLog("WebSocket Error occurred");
+                logStatus("Connection Failed. Is the server running?", true);
             };
         } catch (e) {
-            logStatus("Failed to connect: " + e.message, true);
+            logStatus("Init Error: " + e.message, true);
             document.getElementById('startBtn').disabled = false;
         }
     }
 
     async function startAudioStream() {
         try {
-            // 1. Create Audio Context (No sampleRate forced, prevents crashes)
-            audioContext = new (window.AudioContext || window.webkitAudioContext)();
-            
-            // 2. Ensure Context is running
+            // SAFE AUDIO CONTEXT SETUP
+            // 1. Try to force 16kHz (best for VAD/Pipecat)
+            try {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+            } catch (e) {
+                debugLog("16kHz Context not supported, falling back to native.");
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            }
+
+            debugLog(`Audio Sample Rate: ${audioContext.sampleRate}Hz`);
+
             if (audioContext.state === 'suspended') {
                 await audioContext.resume();
             }
 
-            // 3. Request Microphone
             const stream = await navigator.mediaDevices.getUserMedia({ 
                 audio: {
                     channelCount: 1,
                     echoCancellation: true,
-                    noiseSuppression: true
+                    noiseSuppression: true,
+                    sampleRate: 16000 // Hint to browser
                 } 
             });
             
@@ -103,8 +132,6 @@
 
             inputSource = audioContext.createMediaStreamSource(stream);
 
-            // 4. Add Audio Worklet for raw PCM processing
-            // We use a Data URI to avoid local file fetching errors
             await audioContext.audioWorklet.addModule('data:text/javascript;base64,' + btoa(`
                 class PCMProcessor extends AudioWorkletProcessor {
                     process(inputs, outputs, parameters) {
@@ -140,7 +167,6 @@
         }
     }
 
-    // Audio Playback Queue
     let nextStartTime = 0;
     function playAudioQueue(arrayBuffer) {
         if (!audioContext) return;
@@ -150,9 +176,7 @@
             floatData[i] = audioData[i] / 0x7FFF;
         }
 
-        // Deepgram usually sends back 24k or 16k audio. 
-        // We set this to 16000 or 24000 depending on your Pipecat config.
-        // If voice sounds "slow" or "chipmunk", change this number.
+        // 24000 is common for Deepgram Aura voices. If slow, change to 16000.
         const buffer = audioContext.createBuffer(1, floatData.length, 24000); 
         buffer.getChannelData(0).set(floatData);
 
