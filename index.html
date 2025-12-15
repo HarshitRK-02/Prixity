@@ -1,10 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pixrity Voice Agent</title>
+    <style>
+        body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; background-color: #f0f2f5; margin: 0; }
+        .container { background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); text-align: center; width: 400px; }
+        button { padding: 12px 24px; font-size: 16px; background-color: #007bff; color: white; border: none; border-radius: 8px; cursor: pointer; transition: background 0.2s; margin: 5px; }
+        button:hover { background-color: #0056b3; }
+        button:disabled { background-color: #ccc; cursor: not-allowed; }
+        #status { margin-top: 20px; color: #666; font-weight: bold; min-height: 1.2em; }
+        .visualizer { height: 50px; background: #e9ecef; margin-top: 20px; border-radius: 4px; display: flex; align-items: center; justify-content: center; font-size: 0.9rem; color: #555; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>AI Voice Agent</h2>
+    <p>Powered by Pipecat, Deepgram & Groq</p>
+    
+    <button id="startBtn" onclick="startCall()">Start Conversation</button>
+    <button id="stopBtn" onclick="stopCall()" disabled style="background-color: #dc3545; display: none;">End Call</button>
+
+    <div id="status">Ready to connect...</div>
+
+    <div class="visualizer" id="visualizer">
+        (Microphone Inactive)
+    </div>
+</div>
+
 <script>
     let websocket;
     let audioContext;
     let processor;
     let inputSource;
 
-    // Helper logging function
     function logStatus(message, isError = false) {
         const statusDiv = document.getElementById('status');
         statusDiv.innerText = message;
@@ -17,7 +48,7 @@
         document.getElementById('startBtn').disabled = true;
 
         try {
-            // Connect to WebSocket
+            // Connect to the Python Server
             websocket = new WebSocket("ws://localhost:8765/ws");
             websocket.binaryType = "arraybuffer";
 
@@ -26,7 +57,7 @@
                 document.getElementById('stopBtn').style.display = "inline-block";
                 document.getElementById('stopBtn').disabled = false;
                 
-                // Start mic AFTER connection
+                // Start microphone only after server connects
                 await startAudioStream();
             };
 
@@ -39,32 +70,31 @@
             };
 
             websocket.onerror = (err) => {
-                logStatus("Connection Error. Is the python server running?", true);
+                logStatus("Connection Error. Is the Python server running?", true);
                 console.error(err);
             };
         } catch (e) {
             logStatus("Failed to connect: " + e.message, true);
+            document.getElementById('startBtn').disabled = false;
         }
     }
 
     async function startAudioStream() {
         try {
-            // FIX: Don't force sampleRate here. Let the browser pick the native rate (usually 44100 or 48000).
-            // Forcing 16000 often crashes Windows/Chrome audio drivers.
+            // 1. Create Audio Context (No sampleRate forced, prevents crashes)
             audioContext = new (window.AudioContext || window.webkitAudioContext)();
             
-            // Explicitly resume context (required by some browsers)
+            // 2. Ensure Context is running
             if (audioContext.state === 'suspended') {
                 await audioContext.resume();
             }
 
+            // 3. Request Microphone
             const stream = await navigator.mediaDevices.getUserMedia({ 
                 audio: {
                     channelCount: 1,
                     echoCancellation: true,
-                    noiseSuppression: true,
-                    // We can Request 16k here, but it's a hint, not a hard crash
-                    sampleRate: 16000 
+                    noiseSuppression: true
                 } 
             });
             
@@ -73,17 +103,14 @@
 
             inputSource = audioContext.createMediaStreamSource(stream);
 
-            // Worklet to capture audio
+            // 4. Add Audio Worklet for raw PCM processing
+            // We use a Data URI to avoid local file fetching errors
             await audioContext.audioWorklet.addModule('data:text/javascript;base64,' + btoa(`
                 class PCMProcessor extends AudioWorkletProcessor {
                     process(inputs, outputs, parameters) {
                         const input = inputs[0];
                         if (input.length > 0) {
                             const float32Data = input[0];
-                            // Downsample or simple send. Since we removed the context constraint,
-                            // we are sending 44.1k/48k audio. 
-                            // Deepgram usually handles this, but raw PCM requires converting.
-                            
                             const int16Data = new Int16Array(float32Data.length);
                             for (let i = 0; i < float32Data.length; i++) {
                                 int16Data[i] = Math.max(-1, Math.min(1, float32Data[i])) * 0x7FFF; 
@@ -108,11 +135,12 @@
 
         } catch (err) {
             console.error("Mic Error:", err);
-            logStatus("Mic Access Denied or Error: " + err.message, true);
+            logStatus("Mic Error: " + err.message, true);
+            stopCall();
         }
     }
 
-    // Playback logic
+    // Audio Playback Queue
     let nextStartTime = 0;
     function playAudioQueue(arrayBuffer) {
         if (!audioContext) return;
@@ -122,7 +150,10 @@
             floatData[i] = audioData[i] / 0x7FFF;
         }
 
-        const buffer = audioContext.createBuffer(1, floatData.length, 16000); // Incoming audio is usually 16k/24k
+        // Deepgram usually sends back 24k or 16k audio. 
+        // We set this to 16000 or 24000 depending on your Pipecat config.
+        // If voice sounds "slow" or "chipmunk", change this number.
+        const buffer = audioContext.createBuffer(1, floatData.length, 24000); 
         buffer.getChannelData(0).set(floatData);
 
         const source = audioContext.createBufferSource();
@@ -143,3 +174,5 @@
         document.getElementById('visualizer').innerText = "(Microphone Inactive)";
     }
 </script>
+</body>
+</html>
