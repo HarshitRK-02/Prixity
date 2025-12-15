@@ -1,0 +1,145 @@
+<script>
+    let websocket;
+    let audioContext;
+    let processor;
+    let inputSource;
+
+    // Helper logging function
+    function logStatus(message, isError = false) {
+        const statusDiv = document.getElementById('status');
+        statusDiv.innerText = message;
+        statusDiv.style.color = isError ? "red" : "#666";
+        console.log(message);
+    }
+
+    async function startCall() {
+        logStatus("Connecting to server...");
+        document.getElementById('startBtn').disabled = true;
+
+        try {
+            // Connect to WebSocket
+            websocket = new WebSocket("ws://localhost:8765/ws");
+            websocket.binaryType = "arraybuffer";
+
+            websocket.onopen = async () => {
+                logStatus("Server Connected! Requesting Mic...");
+                document.getElementById('stopBtn').style.display = "inline-block";
+                document.getElementById('stopBtn').disabled = false;
+                
+                // Start mic AFTER connection
+                await startAudioStream();
+            };
+
+            websocket.onmessage = (event) => {
+                playAudioQueue(event.data);
+            };
+
+            websocket.onclose = () => {
+                stopCall();
+            };
+
+            websocket.onerror = (err) => {
+                logStatus("Connection Error. Is the python server running?", true);
+                console.error(err);
+            };
+        } catch (e) {
+            logStatus("Failed to connect: " + e.message, true);
+        }
+    }
+
+    async function startAudioStream() {
+        try {
+            // FIX: Don't force sampleRate here. Let the browser pick the native rate (usually 44100 or 48000).
+            // Forcing 16000 often crashes Windows/Chrome audio drivers.
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            
+            // Explicitly resume context (required by some browsers)
+            if (audioContext.state === 'suspended') {
+                await audioContext.resume();
+            }
+
+            const stream = await navigator.mediaDevices.getUserMedia({ 
+                audio: {
+                    channelCount: 1,
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    // We can Request 16k here, but it's a hint, not a hard crash
+                    sampleRate: 16000 
+                } 
+            });
+            
+            logStatus("Microphone Active! Speak now.");
+            document.getElementById('visualizer').innerText = "(Listening...)";
+
+            inputSource = audioContext.createMediaStreamSource(stream);
+
+            // Worklet to capture audio
+            await audioContext.audioWorklet.addModule('data:text/javascript;base64,' + btoa(`
+                class PCMProcessor extends AudioWorkletProcessor {
+                    process(inputs, outputs, parameters) {
+                        const input = inputs[0];
+                        if (input.length > 0) {
+                            const float32Data = input[0];
+                            // Downsample or simple send. Since we removed the context constraint,
+                            // we are sending 44.1k/48k audio. 
+                            // Deepgram usually handles this, but raw PCM requires converting.
+                            
+                            const int16Data = new Int16Array(float32Data.length);
+                            for (let i = 0; i < float32Data.length; i++) {
+                                int16Data[i] = Math.max(-1, Math.min(1, float32Data[i])) * 0x7FFF; 
+                            }
+                            this.port.postMessage(int16Data.buffer);
+                        }
+                        return true;
+                    }
+                }
+                registerProcessor('pcm-processor', PCMProcessor);
+            `));
+
+            processor = new AudioWorkletNode(audioContext, 'pcm-processor');
+            inputSource.connect(processor);
+            processor.connect(audioContext.destination);
+
+            processor.port.onmessage = (e) => {
+                if (websocket && websocket.readyState === WebSocket.OPEN) {
+                    websocket.send(e.data);
+                }
+            };
+
+        } catch (err) {
+            console.error("Mic Error:", err);
+            logStatus("Mic Access Denied or Error: " + err.message, true);
+        }
+    }
+
+    // Playback logic
+    let nextStartTime = 0;
+    function playAudioQueue(arrayBuffer) {
+        if (!audioContext) return;
+        const audioData = new Int16Array(arrayBuffer);
+        const floatData = new Float32Array(audioData.length);
+        for (let i = 0; i < audioData.length; i++) {
+            floatData[i] = audioData[i] / 0x7FFF;
+        }
+
+        const buffer = audioContext.createBuffer(1, floatData.length, 16000); // Incoming audio is usually 16k/24k
+        buffer.getChannelData(0).set(floatData);
+
+        const source = audioContext.createBufferSource();
+        source.buffer = buffer;
+        source.connect(audioContext.destination);
+
+        if (nextStartTime < audioContext.currentTime) nextStartTime = audioContext.currentTime;
+        source.start(nextStartTime);
+        nextStartTime += buffer.duration;
+    }
+
+    function stopCall() {
+        if (websocket) websocket.close();
+        if (audioContext) audioContext.close();
+        document.getElementById('startBtn').disabled = false;
+        document.getElementById('stopBtn').style.display = "none";
+        logStatus("Disconnected");
+        document.getElementById('visualizer').innerText = "(Microphone Inactive)";
+    }
+</script>
