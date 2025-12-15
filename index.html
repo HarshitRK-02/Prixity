@@ -1,202 +1,123 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Pixrity Voice Agent</title>
-    <style>
-        body { font-family: 'Segoe UI', sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; background-color: #f0f2f5; margin: 0; }
-        .container { background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.1); text-align: center; width: 400px; }
-        button { padding: 12px 24px; font-size: 16px; background-color: #007bff; color: white; border: none; border-radius: 8px; cursor: pointer; transition: all 0.2s; margin: 5px; font-weight: 600; }
-        button:hover { background-color: #0056b3; transform: translateY(-1px); }
-        button:disabled { background-color: #ccc; cursor: not-allowed; transform: none; }
-        #status { margin-top: 20px; color: #666; font-weight: bold; min-height: 1.2em; padding: 10px; border-radius: 4px; }
-        .visualizer { height: 50px; background: #e9ecef; margin-top: 20px; border-radius: 4px; display: flex; align-items: center; justify-content: center; font-size: 0.9rem; color: #555; }
-        .debug-info { margin-top: 20px; font-size: 12px; color: #999; text-align: left; background: #f8f9fa; padding: 10px; border-radius: 4px; border: 1px solid #eee; display: none;}
-    </style>
-</head>
-<body>
+import os
+import sys
+import uvicorn
+from dotenv import load_dotenv
+from fastapi import FastAPI, WebSocket
+from loguru import logger
 
-<div class="container">
-    <h2>AI Voice Agent</h2>
-    <p>Powered by Pipecat, Deepgram & Groq</p>
+# --- Robust Imports for Pipecat 0.0.97+ ---
+try:
+    from pipecat.pipeline.pipeline import Pipeline
+    from pipecat.pipeline.runner import PipelineRunner
+    from pipecat.pipeline.task import PipelineTask
+    from pipecat.processors.aggregators.llm_response import LLMUserResponseAggregator
+    from pipecat.services.deepgram.stt import DeepgramSTTService
+    from pipecat.services.deepgram.tts import DeepgramTTSService
+    from pipecat.services.openai.llm import OpenAILLMService
+    from pipecat.transports.websocket.fastapi import FastAPIWebsocketTransport, FastAPIWebsocketParams
     
-    <button id="startBtn" onclick="startCall()">Start Conversation</button>
-    <button id="stopBtn" onclick="stopCall()" disabled style="background-color: #dc3545; display: none;">End Call</button>
+    # Import Context handling
+    # Depending on version, this might be in different spots. We try standard first.
+    from pipecat.processors.aggregators.llm_response import LLMContext
+except ImportError as e:
+    print(f"\nCRITICAL IMPORT ERROR: {e}")
+    print("Please run: pip install -U pipecat-ai[deepgram,openai]\n")
+    sys.exit(1)
 
-    <div id="status">Ready to connect...</div>
+# Import VAD (Voice Activity Detection)
+try:
+    from pipecat.audio.vad.silence import SilenceVAD
+except ImportError:
+    try:
+        from pipecat.vad.silence import SilenceVAD
+    except:
+        SilenceVAD = None
+        print("Warning: SilenceVAD not found. VAD disabled.")
 
-    <div class="visualizer" id="visualizer">
-        (Microphone Inactive)
-    </div>
+load_dotenv()
+
+# Enable Debug Logs - This will show you "STT: [Your Words]" in the terminal
+logger.remove()
+logger.add(sys.stderr, level="DEBUG")
+
+app = FastAPI()
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
     
-    <div id="debug" class="debug-info"></div>
-</div>
-
-<script>
-    let websocket;
-    let audioContext;
-    let processor;
-    let inputSource;
-    let keepErrorOnScreen = false;
-
-    function logStatus(message, isError = false) {
-        // If we have a critical error, don't overwrite it with "Disconnected"
-        if (keepErrorOnScreen && !isError && message === "Disconnected") return;
-
-        const statusDiv = document.getElementById('status');
-        statusDiv.innerText = message;
-        statusDiv.style.backgroundColor = isError ? "#ffebee" : "transparent";
-        statusDiv.style.color = isError ? "#c62828" : "#666";
-        console.log(`[Status] ${message}`);
-        
-        if (isError) keepErrorOnScreen = true;
-    }
-
-    function debugLog(msg) {
-        const d = document.getElementById('debug');
-        d.style.display = 'block';
-        d.innerHTML += `<div>${msg}</div>`;
-        console.log(`[Debug] ${msg}`);
-    }
-
-    async function startCall() {
-        keepErrorOnScreen = false;
-        document.getElementById('debug').innerHTML = "";
-        logStatus("Connecting to server...");
-        document.getElementById('startBtn').disabled = true;
-
-        try {
-            websocket = new WebSocket("ws://localhost:8765/ws");
-            websocket.binaryType = "arraybuffer";
-
-            websocket.onopen = async () => {
-                logStatus("Server Connected! Starting Mic...");
-                debugLog("WebSocket Open");
-                document.getElementById('stopBtn').style.display = "inline-block";
-                document.getElementById('stopBtn').disabled = false;
-                await startAudioStream();
-            };
-
-            websocket.onmessage = (event) => {
-                playAudioQueue(event.data);
-            };
-
-            websocket.onclose = (event) => {
-                debugLog(`WebSocket Closed. Code: ${event.code}, Reason: ${event.reason || 'None'}`);
-                if (event.code === 1006) {
-                    logStatus("Error: Server closed connection unexpectedly. Check Python terminal for crash.", true);
-                } else {
-                    stopCall();
-                }
-            };
-
-            websocket.onerror = (err) => {
-                debugLog("WebSocket Error occurred");
-                logStatus("Connection Failed. Is the server running?", true);
-            };
-        } catch (e) {
-            logStatus("Init Error: " + e.message, true);
-            document.getElementById('startBtn').disabled = false;
-        }
-    }
-
-    async function startAudioStream() {
-        try {
-            // SAFE AUDIO CONTEXT SETUP
-            // 1. Try to force 16kHz (best for VAD/Pipecat)
-            try {
-                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-            } catch (e) {
-                debugLog("16kHz Context not supported, falling back to native.");
-                audioContext = new (window.AudioContext || window.webkitAudioContext)();
-            }
-
-            debugLog(`Audio Sample Rate: ${audioContext.sampleRate}Hz`);
-
-            if (audioContext.state === 'suspended') {
-                await audioContext.resume();
-            }
-
-            const stream = await navigator.mediaDevices.getUserMedia({ 
-                audio: {
-                    channelCount: 1,
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    sampleRate: 16000 // Hint to browser
-                } 
-            });
-            
-            logStatus("Microphone Active! Speak now.");
-            document.getElementById('visualizer').innerText = "(Listening...)";
-
-            inputSource = audioContext.createMediaStreamSource(stream);
-
-            await audioContext.audioWorklet.addModule('data:text/javascript;base64,' + btoa(`
-                class PCMProcessor extends AudioWorkletProcessor {
-                    process(inputs, outputs, parameters) {
-                        const input = inputs[0];
-                        if (input.length > 0) {
-                            const float32Data = input[0];
-                            const int16Data = new Int16Array(float32Data.length);
-                            for (let i = 0; i < float32Data.length; i++) {
-                                int16Data[i] = Math.max(-1, Math.min(1, float32Data[i])) * 0x7FFF; 
-                            }
-                            this.port.postMessage(int16Data.buffer);
-                        }
-                        return true;
-                    }
-                }
-                registerProcessor('pcm-processor', PCMProcessor);
-            `));
-
-            processor = new AudioWorkletNode(audioContext, 'pcm-processor');
-            inputSource.connect(processor);
-            processor.connect(audioContext.destination);
-
-            processor.port.onmessage = (e) => {
-                if (websocket && websocket.readyState === WebSocket.OPEN) {
-                    websocket.send(e.data);
-                }
-            };
-
-        } catch (err) {
-            console.error("Mic Error:", err);
-            logStatus("Mic Error: " + err.message, true);
-            stopCall();
-        }
-    }
-
-    let nextStartTime = 0;
-    function playAudioQueue(arrayBuffer) {
-        if (!audioContext) return;
-        const audioData = new Int16Array(arrayBuffer);
-        const floatData = new Float32Array(audioData.length);
-        for (let i = 0; i < audioData.length; i++) {
-            floatData[i] = audioData[i] / 0x7FFF;
+    # 1. VAD Configuration (Helps detect when you stop speaking)
+    vad_args = {"vad_enabled": False}
+    if SilenceVAD:
+        vad_args = {
+            "vad_enabled": True,
+            "vad_analyzer": SilenceVAD(
+                start_silence_time=0.5, # Wait 0.5s speech to start
+                stop_silence_time=0.6   # Wait 0.6s silence to consider "done"
+            ), 
+            "vad_audio_passthrough": True
         }
 
-        // 24000 is common for Deepgram Aura voices. If slow, change to 16000.
-        const buffer = audioContext.createBuffer(1, floatData.length, 24000); 
-        buffer.getChannelData(0).set(floatData);
+    # 2. Transport
+    transport = FastAPIWebsocketTransport(
+        websocket=websocket,
+        params=FastAPIWebsocketParams(
+            audio_out_enabled=True,
+            add_wav_header=True,
+            **vad_args
+        )
+    )
 
-        const source = audioContext.createBufferSource();
-        source.buffer = buffer;
-        source.connect(audioContext.destination);
+    # 3. Services
+    stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+    
+    llm = OpenAILLMService(
+        api_key=os.getenv("GROQ_API_KEY"),
+        base_url="https://api.groq.com/openai/v1",
+        model="llama3-8b-8192" 
+    )
 
-        if (nextStartTime < audioContext.currentTime) nextStartTime = audioContext.currentTime;
-        source.start(nextStartTime);
-        nextStartTime += buffer.duration;
-    }
+    tts = DeepgramTTSService(
+        api_key=os.getenv("DEEPGRAM_API_KEY"),
+        voice="aura-asteria-en"
+    )
 
-    function stopCall() {
-        if (websocket) websocket.close();
-        if (audioContext) audioContext.close();
-        document.getElementById('startBtn').disabled = false;
-        document.getElementById('stopBtn').style.display = "none";
-        logStatus("Disconnected");
-        document.getElementById('visualizer').innerText = "(Microphone Inactive)";
-    }
-</script>
-</body>
-</html>
+    # 4. Context & Aggregator (THE MISSING LINK)
+    # This keeps track of the conversation history
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a helpful voice assistant from Pixrity. Keep your answers very short, concise, and conversational."
+        }
+    ]
+    context = LLMContext(messages=messages)
+    context_aggregator = LLMUserResponseAggregator(context)
+
+    # 5. Pipeline
+    pipeline = Pipeline(
+        [
+            transport.input(),      # 1. Get Audio
+            stt,                    # 2. Audio -> Text
+            context_aggregator,     # 3. Text -> LLM Context (Fixes the silence issue)
+            llm,                    # 4. Context -> Text Response
+            tts,                    # 5. Text -> Audio Response
+            transport.output()      # 6. Play Audio
+        ]
+    )
+
+    task = PipelineTask(
+        pipeline,
+        params=PipelineTask.PipelineParams(
+            allow_interruptions=True
+        )
+    )
+
+    runner = PipelineRunner()
+
+    print("\n--- Voice Agent Running ---")
+    print("Speak into the mic. Check this terminal for STT logs.\n")
+    
+    await runner.run(task)
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8765)
